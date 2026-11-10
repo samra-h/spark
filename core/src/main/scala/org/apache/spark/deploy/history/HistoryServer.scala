@@ -17,6 +17,7 @@
 
 package org.apache.spark.deploy.history
 
+import java.util.regex.Pattern
 import java.util.zip.ZipOutputStream
 
 import scala.util.control.NonFatal
@@ -32,6 +33,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys._
 import org.apache.spark.internal.config.History
 import org.apache.spark.internal.config.UI._
+import org.apache.spark.status.AppHistoryServerPlugin
 import org.apache.spark.status.api.v1.{ApiRootResource, ApplicationInfo, UIRoot}
 import org.apache.spark.ui.{SparkUI, UIUtils, WebUI}
 import org.apache.spark.util.{ShutdownHookManager, SystemClock, Utils}
@@ -155,12 +157,62 @@ class HistoryServer(
     attachHandler(ApiRootResource.getServletHandler(this))
 
     addStaticHandler(SparkUI.STATIC_RESOURCE_DIR)
+    setupPluginStaticResources(AppHistoryServerPlugin.loadPlugins())
     addRenderLogHandler(this, conf)
 
     val contextHandler = new ServletContextHandler
     contextHandler.setContextPath(HistoryServer.UI_PATH_PREFIX)
     contextHandler.addServlet(new ServletHolder(loaderServlet), "/*")
     attachHandler(contextHandler)
+  }
+
+  /**
+   * Registers the static resources declared by the given plugins, as (classpath resource
+   * directory, URL path) pairs.
+   *
+   * A failure while reading, validating or creating the handler for an entry is logged as a
+   * warning and does not prevent the History Server from starting. The rest is still
+   * registered:
+   *  - if reading a plugin's `staticResources` throws, that plugin is skipped;
+   *  - each declared entry is registered independently, so one failing entry (for example a
+   *    missing directory) does not skip the plugin's later entries.
+   *
+   * This does not cover adding the handlers to Jetty and starting them, which happens later in
+   * `bind()`. A failure there makes the History Server exit, as for any other handler.
+   *
+   * A path is rejected as a failing entry unless it is a single segment under `/static/` made
+   * of letters, digits, `_` or `-` (e.g. `/static/sql`) that the server does not already serve.
+   * Jetty normalizes a context path (it resolves `..` and `%2e`, and drops a trailing `/`), so
+   * anything else could end up shadowing the History Server's own routes or its core static
+   * files, or fail to start.
+   */
+  private[history] def setupPluginStaticResources(
+      plugins: Seq[AppHistoryServerPlugin]): Unit = {
+    plugins.foreach { plugin =>
+      try {
+        plugin.staticResources.foreach { entry =>
+          try {
+            // Destructured inside the try, so that a malformed entry (e.g. null) is skipped too
+            val (dir, path) = entry
+            require(HistoryServer.PLUGIN_STATIC_PATH_PATTERN.matcher(path).matches(),
+              s"path must be a single segment under /static/ matching " +
+                s"${HistoryServer.PLUGIN_STATIC_PATH_PATTERN.pattern()}")
+            require(!getHandlers.exists(_.getContextPath == path),
+              "path is already served by the History Server")
+            addStaticHandler(dir, path)
+          } catch {
+            case t if NonFatal(t) || t.isInstanceOf[LinkageError] =>
+              logWarning(log"Failed to set up the static resource " +
+                log"${MDC(RESOURCE, entry)} (directory, path) for " +
+                log"${MDC(CLASS_NAME, plugin.getClass.getName)}", t)
+          }
+        }
+      } catch {
+        case t if NonFatal(t) || t.isInstanceOf[LinkageError] =>
+          logWarning(log"Failed to get the static resources declared by " +
+            log"${MDC(CLASS_NAME, plugin.getClass.getName)}", t)
+      }
+    }
   }
 
   /** Bind to the HTTP server behind this web interface. */
@@ -174,6 +226,18 @@ class HistoryServer(
     provider.stop()
   }
 
+  // The context paths this server serves itself. They do not change after initialize().
+  private lazy val servedPaths: Set[String] = getHandlers.map(_.getContextPath).toSet
+
+  /**
+   * The handlers of an application UI to attach to this server. A handler for a path the server
+   * already serves (e.g. /static/sql) is left out: the server's own handler is attached first and
+   * always answers, so the application's copy would never receive a request.
+   */
+  private def attachedHandlers(ui: SparkUI): Seq[ServletContextHandler] = {
+    ui.getHandlers.filterNot(h => servedPaths.contains(h.getContextPath))
+  }
+
   /** Attach a reconstructed UI to this server. Only valid after bind(). */
   override def attachSparkUI(
       appId: String,
@@ -181,7 +245,7 @@ class HistoryServer(
       ui: SparkUI,
       completed: Boolean): Unit = {
     assert(serverInfo.isDefined, "HistoryServer must be bound before attaching SparkUIs")
-    ui.getHandlers.foreach { handler =>
+    attachedHandlers(ui).foreach { handler =>
       serverInfo.get.addHandler(handler, ui.securityManager)
     }
   }
@@ -189,7 +253,7 @@ class HistoryServer(
   /** Detach a reconstructed UI from this server. Only valid after bind(). */
   override def detachSparkUI(appId: String, attemptId: Option[String], ui: SparkUI): Unit = {
     assert(serverInfo.isDefined, "HistoryServer must be bound before detaching SparkUIs")
-    ui.getHandlers.foreach(detachHandler)
+    attachedHandlers(ui).foreach(detachHandler)
     provider.onUIDetached(appId, attemptId, ui)
   }
 
@@ -300,6 +364,10 @@ object HistoryServer extends Logging {
   private lazy val conf = new SparkConf
 
   val UI_PATH_PREFIX = "/history"
+
+  // Plugin static resource paths must be a single segment under /static/
+  // so that Jetty's path normalization cannot move them elsewhere
+  private[history] val PLUGIN_STATIC_PATH_PATTERN = Pattern.compile("/static/[\\w-]+")
 
   def main(argStrings: Array[String]): Unit = {
     Utils.resetStructuredLogging()

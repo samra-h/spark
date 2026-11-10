@@ -34,11 +34,12 @@ class SQLTab(val sqlStore: SQLAppStatusStore, sparkUI: SparkUI)
   attachPage(new ExecutionPage(this))
   parent.attachTab(this)
 
-  parent.addStaticHandler(SQLTab.STATIC_RESOURCE_DIR, "/static/sql")
+  parent.addStaticHandler(SQLTab.STATIC_RESOURCE_DIR, SQLTab.STATIC_RESOURCE_PATH)
 
   override def displayOrder: Int = 0
 }
 
 object SQLTab {
-  private val STATIC_RESOURCE_DIR = "org/apache/spark/sql/execution/ui/static"
+  private[sql] val STATIC_RESOURCE_DIR = "org/apache/spark/sql/execution/ui/static"
+  private[sql] val STATIC_RESOURCE_PATH = "/static/sql"
 }
