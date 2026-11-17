@@ -744,9 +744,31 @@ abstract class HistoryServerSuite extends SparkFunSuite with BeforeAndAfter with
     assert(conn.getResponseCode === 302)
     assert(conn.getHeaderField("Location") === s"http://$localhost:$port/")
   }
+
+  test("SPARK-59613: /static/sql resources are served on startup without loading any app") {
+    stop()
+    init()
+
+    val port = server.boundPort
+    Seq(
+      "spark-sql-viz.css",
+      "spark-sql-viz.js").foreach { name =>
+      val url = new URI(s"http://$localhost:$port/static/sql/$name").toURL
+      assert(HistoryServerSuite.getUrl(url) === HistoryServerSuite.bundledStaticFile(s"sql/$name"),
+        s"$url did not return the bundled file")
+    }
+    assert(server.cacheMetrics.loadCount.getCount === 0, "no apps should be loaded")
+  }
 }
 
 object HistoryServerSuite {
+
+  /** Returns a file bundled under the core static resource dir, e.g. "sql/spark-sql-viz.js". */
+  def bundledStaticFile(relativePath: String): String = {
+    val in = getClass.getResourceAsStream(s"/${SparkUI.STATIC_RESOURCE_DIR}/$relativePath")
+    assert(in != null, s"missing bundled static file $relativePath")
+    Utils.tryWithResource(in)(s => new String(s.readAllBytes(), StandardCharsets.UTF_8))
+  }
 
   def getContentAndCode(url: URL): (Int, Option[String], Option[String]) = {
     val (code, in, errString) = connectAndGetInputStream(url)
